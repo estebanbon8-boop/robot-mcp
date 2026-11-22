@@ -75,11 +75,35 @@ def _structure():
     return app, app.Project.Structure, C
 
 
+def _cast(obj, interface: str):
+    """Robot renvoie souvent des objets génériques (IRobotDataObject, IRobotCase) :
+    il faut les convertir vers l'interface réelle pour accéder à leurs propriétés."""
+    from win32com.client import CastTo
+
+    try:
+        return CastTo(obj, interface)
+    except Exception:
+        return obj
+
+
+def _node(s, n):
+    return _cast(s.Nodes.Get(int(n)), "IRobotNode")
+
+
+def _bar(s, b):
+    return _cast(s.Bars.Get(int(b)), "IRobotBar")
+
+
+def _case(s, c):
+    return _cast(s.Cases.Get(int(c)), "IRobotSimpleCase")
+
+
 def _numbers(structure, C, obj_type: str, text: str) -> list[int]:
     """Convertit une sélection texte Robot ('1to5', '1 3 7', 'all') en liste de numéros."""
     if text.strip().lower() in ("all", "tout", "tous"):
         coll = structure.Nodes.GetAll() if obj_type == "node" else structure.Bars.GetAll()
-        return [coll.Get(i).Number for i in range(1, coll.Count + 1)]
+        iface = "IRobotNode" if obj_type == "node" else "IRobotBar"
+        return [_cast(coll.Get(i), iface).Number for i in range(1, coll.Count + 1)]
     sel = structure.Selections.Create(C.I_OT_NODE if obj_type == "node" else C.I_OT_BAR)
     sel.FromText(text)
     return [sel.Get(i) for i in range(1, sel.Count + 1)]
@@ -256,14 +280,14 @@ async def robot_list_model(max_items: int = 300) -> dict:
         nodes, bars = [], []
         coll = s.Nodes.GetAll()
         for i in range(1, min(coll.Count, max_items) + 1):
-            n = coll.Get(i)
+            n = _cast(coll.Get(i), "IRobotNode")
             nodes.append(
                 {"id": n.Number, "x": round(n.X, 4), "y": round(n.Y, 4), "z": round(n.Z, 4),
                  "appui": n.GetLabelName(C.I_LT_SUPPORT) if n.HasLabel(C.I_LT_SUPPORT) else None}
             )
         coll = s.Bars.GetAll()
         for i in range(1, min(coll.Count, max_items) + 1):
-            b = coll.Get(i)
+            b = _cast(coll.Get(i), "IRobotBar")
             bars.append(
                 {"id": b.Number, "start": b.StartNode, "end": b.EndNode,
                  "section": b.GetLabelName(C.I_LT_BAR_SECTION) if b.HasLabel(C.I_LT_BAR_SECTION) else None,
@@ -370,7 +394,7 @@ async def robot_add_self_weight(case: int) -> dict:
 
     def f():
         _, s, C = _structure()
-        rec = s.Cases.Get(int(case)).Records.New(C.I_LRT_DEAD)
+        rec = _case(s, case).Records.New(C.I_LRT_DEAD)
         rec.SetValue(C.I_DRV_Z, -1)
         rec.SetValue(C.I_DRV_ENTIRE_STRUCTURE, 1)
         return {"ok": True, "cas": case}
@@ -385,7 +409,7 @@ async def robot_add_nodal_force(case: int, nodes: str, fx_kN: float = 0, fy_kN: 
 
     def f():
         _, s, C = _structure()
-        rec = s.Cases.Get(int(case)).Records.New(C.I_LRT_NODE_FORCE)
+        rec = _case(s, case).Records.New(C.I_LRT_NODE_FORCE)
         for key, v in (("I_NFRV_FX", fx_kN), ("I_NFRV_FY", fy_kN), ("I_NFRV_FZ", fz_kN),
                        ("I_NFRV_CX", mx_kNm), ("I_NFRV_CY", my_kNm), ("I_NFRV_CZ", mz_kNm)):
             if v:
@@ -404,7 +428,7 @@ async def robot_add_bar_uniform_load(case: int, bars: str, pz_kN_m: float = 0, p
 
     def f():
         _, s, C = _structure()
-        rec = s.Cases.Get(int(case)).Records.New(C.I_LRT_BAR_UNIFORM)
+        rec = _case(s, case).Records.New(C.I_LRT_BAR_UNIFORM)
         for key, v in (("I_BURV_PX", px_kN_m), ("I_BURV_PY", py_kN_m), ("I_BURV_PZ", pz_kN_m)):
             if v:
                 rec.SetValue(getattr(C, key), v * KN)
@@ -424,7 +448,7 @@ async def robot_add_bar_point_load(case: int, bars: str, fz_kN: float, position:
 
     def f():
         _, s, C = _structure()
-        rec = s.Cases.Get(int(case)).Records.New(C.I_LRT_BAR_FORCE_CONCENTRATED)
+        rec = _case(s, case).Records.New(C.I_LRT_BAR_FORCE_CONCENTRATED)
         rec.SetValue(C.I_BFCRV_FZ, fz_kN * KN)
         rec.SetValue(C.I_BFCRV_X, position)
         rec.SetValue(C.I_BFCRV_REL, 1 if relative else 0)
@@ -457,7 +481,8 @@ async def robot_list_cases() -> dict:
     def f():
         _, s, _ = _structure()
         coll = s.Cases.GetAll()
-        return {"cas": [{"id": coll.Get(i).Number, "nom": coll.Get(i).Name} for i in range(1, coll.Count + 1)]}
+        items = [_cast(coll.Get(i), "IRobotCase") for i in range(1, coll.Count + 1)]
+        return {"cas": [{"id": c.Number, "nom": c.Name} for c in items]}
 
     return await _run(f)
 
@@ -575,8 +600,8 @@ async def robot_export_diagrams(bars: str, case: int, quantities: list[str] | No
         n = max(3, int(points))
         rows, x0 = [], 0.0
         for b in _numbers(s, C, "bar", bars):
-            bar = s.Bars.Get(b)
-            a, e = s.Nodes.Get(bar.StartNode), s.Nodes.Get(bar.EndNode)
+            bar = _bar(s, b)
+            a, e = _node(s, bar.StartNode), _node(s, bar.EndNode)
             L = ((e.X - a.X) ** 2 + (e.Y - a.Y) ** 2 + (e.Z - a.Z) ** 2) ** 0.5
             for k in range(n):
                 r = k / (n - 1)
@@ -584,7 +609,7 @@ async def robot_export_diagrams(bars: str, case: int, quantities: list[str] | No
                 row = {"barre": b, "x_m": round(x0 + r * L, 4), "MY": v.MY / KN, "FZ": v.FZ / KN,
                        "FX": v.FX / KN, "MZ": v.MZ / KN, "FY": v.FY / KN}
                 if "UZ" in qs:
-                    row["UZ"] = defl.Value(b, int(case), r).UZ * 1000
+                    row["UZ"] = _cast(defl.Value(b, int(case), r), "IRobotBarDeflectionData").UZ * 1000
                 rows.append(row)
             x0 += L
         base = os.path.dirname(app.Project.FileName) if app.Project.FileName else _default_dir()
@@ -732,6 +757,18 @@ def main() -> None:
         for t in tools:
             print(" -", t.name, file=sys.stderr)
         return
+    import threading
+
+    def _prewarm():  # le 1er import de matplotlib (cache de polices) peut prendre ~1 min
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot  # noqa: F401
+        except Exception as exc:
+            log.error(f"matplotlib : {exc}")
+
+    threading.Thread(target=_prewarm, daemon=True).start()
     mcp.run()
 
 
