@@ -98,6 +98,24 @@ def _case(s, c):
     return _cast(s.Cases.Get(int(c)), "IRobotSimpleCase")
 
 
+def _add_record(s, case, record_type, values: dict, objects: str | None = None):
+    """Ajoute un chargement à un cas. Records.New renvoie un INDICE (pas l'objet) :
+    on récupère l'enregistrement par Get(indice). En cas d'erreur, l'enregistrement vide est supprimé."""
+    recs = _case(s, case).Records
+    idx = recs.New(record_type)
+    try:
+        rec = _cast(recs.Get(idx), "IRobotLoadRecord")
+        for key, val in values.items():
+            rec.SetValue(key, val)
+        if objects:
+            rec.Objects.FromText(objects)
+    except Exception:
+        with contextlib.suppress(Exception):
+            recs.Delete(idx)
+        raise
+    return idx
+
+
 def _numbers(structure, C, obj_type: str, text: str) -> list[int]:
     """Convertit une sélection texte Robot ('1to5', '1 3 7', 'all') en liste de numéros."""
     if text.strip().lower() in ("all", "tout", "tous"):
@@ -118,7 +136,7 @@ def _sel(structure, C, obj_type: str, text: str):
     return sel
 
 
-TIMEOUT_S = 150
+TIMEOUT_S = 300
 
 
 def _quiet(fn):
@@ -225,13 +243,18 @@ def _default_dir():
     return d
 
 
-def _save(app, path: str = "", name: str = "") -> str:
+def _save(app, path: str = "", name: str = "", overwrite: bool = False) -> str:
     import datetime
     import os
 
     if path:
         if not path.lower().endswith(".rtd"):
             path += ".rtd"
+        current = (app.Project.FileName or "").lower()
+        if os.path.exists(path) and os.path.abspath(path).lower() != current and not overwrite:
+            raise FileExistsError(f"{path} existe déjà. Choisir un autre nom, ou overwrite=True "
+                                  "après accord explicite de l'utilisateur.")
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         app.Project.SaveAs(path)
         return path
     if app.Project.FileName:
@@ -239,14 +262,19 @@ def _save(app, path: str = "", name: str = "") -> str:
         return app.Project.FileName
     stem = name or "projet_" + datetime.datetime.now().strftime("%Y%m%d_%H%M")
     path = os.path.join(_default_dir(), stem + ".rtd")
+    k = 2
+    while os.path.exists(path):  # jamais d'écrasement silencieux
+        path = os.path.join(_default_dir(), f"{stem}_{k}.rtd")
+        k += 1
     app.Project.SaveAs(path)
     return path
 
 
 @mcp.tool()
-async def robot_save_project(path: str = "", name: str = "") -> dict:
+async def robot_save_project(path: str = "", name: str = "", overwrite: bool = False) -> dict:
     """Enregistre le projet (.rtd) pour que l'utilisateur puisse le rouvrir et le modifier dans Robot.
-    - path : chemin complet 'Enregistrer sous'.
+    - path : chemin complet 'Enregistrer sous'. Refuse d'écraser un AUTRE fichier existant sauf overwrite=True
+      (à n'utiliser qu'avec l'accord explicite de l'utilisateur).
     - sinon, si le projet a déjà un fichier : enregistrement simple.
     - sinon : Documents\\Robot-MCP\\<name ou projet_date>.rtd.
     À appeler juste après la création du modèle, puis après chaque modification et après le calcul.
@@ -254,7 +282,7 @@ async def robot_save_project(path: str = "", name: str = "") -> dict:
 
     def f():
         app, _ = _robot()
-        return {"ok": True, "fichier": _save(app, path, name)}
+        return {"ok": True, "fichier": _save(app, path, name, overwrite)}
 
     return await _run(f)
 
@@ -429,9 +457,7 @@ async def robot_add_self_weight(case: int) -> dict:
 
     def f():
         _, s, C = _structure()
-        rec = _case(s, case).Records.New(C.I_LRT_DEAD)
-        rec.SetValue(C.I_DRV_Z, -1)
-        rec.SetValue(C.I_DRV_ENTIRE_STRUCTURE, 1)
+        _add_record(s, case, C.I_LRT_DEAD, {C.I_DRV_Z: -1, C.I_DRV_ENTIRE_STRUCTURE: 1})
         return {"ok": True, "cas": case}
 
     return await _run(f)
@@ -444,12 +470,10 @@ async def robot_add_nodal_force(case: int, nodes: str, fx_kN: float = 0, fy_kN: 
 
     def f():
         _, s, C = _structure()
-        rec = _case(s, case).Records.New(C.I_LRT_NODE_FORCE)
-        for key, v in (("I_NFRV_FX", fx_kN), ("I_NFRV_FY", fy_kN), ("I_NFRV_FZ", fz_kN),
-                       ("I_NFRV_CX", mx_kNm), ("I_NFRV_CY", my_kNm), ("I_NFRV_CZ", mz_kNm)):
-            if v:
-                rec.SetValue(getattr(C, key), v * KN)
-        rec.Objects.FromText(nodes)
+        vals = {getattr(C, k): v * KN for k, v in (
+            ("I_NFRV_FX", fx_kN), ("I_NFRV_FY", fy_kN), ("I_NFRV_FZ", fz_kN),
+            ("I_NFRV_CX", mx_kNm), ("I_NFRV_CY", my_kNm), ("I_NFRV_CZ", mz_kNm)) if v}
+        _add_record(s, case, C.I_LRT_NODE_FORCE, vals, nodes)
         return {"ok": True}
 
     return await _run(f)
@@ -463,13 +487,11 @@ async def robot_add_bar_uniform_load(case: int, bars: str, pz_kN_m: float = 0, p
 
     def f():
         _, s, C = _structure()
-        rec = _case(s, case).Records.New(C.I_LRT_BAR_UNIFORM)
-        for key, v in (("I_BURV_PX", px_kN_m), ("I_BURV_PY", py_kN_m), ("I_BURV_PZ", pz_kN_m)):
-            if v:
-                rec.SetValue(getattr(C, key), v * KN)
+        vals = {getattr(C, k): v * KN for k, v in (
+            ("I_BURV_PX", px_kN_m), ("I_BURV_PY", py_kN_m), ("I_BURV_PZ", pz_kN_m)) if v}
         if projected:
-            rec.SetValue(C.I_BURV_PROJECTED, 1)
-        rec.Objects.FromText(bars)
+            vals[C.I_BURV_PROJECTED] = 1
+        _add_record(s, case, C.I_LRT_BAR_UNIFORM, vals, bars)
         return {"ok": True}
 
     return await _run(f)
@@ -483,11 +505,8 @@ async def robot_add_bar_point_load(case: int, bars: str, fz_kN: float, position:
 
     def f():
         _, s, C = _structure()
-        rec = _case(s, case).Records.New(C.I_LRT_BAR_FORCE_CONCENTRATED)
-        rec.SetValue(C.I_BFCRV_FZ, fz_kN * KN)
-        rec.SetValue(C.I_BFCRV_X, position)
-        rec.SetValue(C.I_BFCRV_REL, 1 if relative else 0)
-        rec.Objects.FromText(bars)
+        _add_record(s, case, C.I_LRT_BAR_FORCE_CONCENTRATED,
+                    {C.I_BFCRV_FZ: fz_kN * KN, C.I_BFCRV_X: position, C.I_BFCRV_REL: 1 if relative else 0}, bars)
         return {"ok": True}
 
     return await _run(f)
@@ -792,6 +811,20 @@ def main() -> None:
         for t in tools:
             print(" -", t.name, file=sys.stderr)
         return
+    import threading
+
+    def _prewarm():  # import différé de matplotlib, après la connexion à Claude
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot  # noqa: F401
+        except Exception as exc:
+            log.error(f"matplotlib : {exc}")
+
+    t = threading.Timer(30.0, _prewarm)
+    t.daemon = True
+    t.start()
     mcp.run()
 
 
