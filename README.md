@@ -12,9 +12,17 @@ Serveur **MCP** pour piloter **Autodesk Robot Structural Analysis Professional**
 | Géométrie | `robot_add_nodes`, `robot_add_bars`, `robot_delete`, `robot_list_model` |
 | Propriétés | `robot_set_section`, `robot_set_material`, `robot_set_support` |
 | Charges | `robot_add_load_case`, `robot_add_self_weight`, `robot_add_nodal_force`, `robot_add_bar_uniform_load`, `robot_add_bar_point_load`, `robot_add_combination`, `robot_list_cases` |
-| Calcul | `robot_calculate` |
+| Calcul | `robot_calculate` (enregistre automatiquement le projet, résultats inclus) |
 | Résultats | `robot_bar_forces`, `robot_node_reactions` (avec somme pour contrôle d'équilibre), `robot_node_displacements` |
+| Diagrammes | `robot_export_diagrams` — courbes M, V, N, flèche en **PNG** + **CSV** (Excel), avec extremums |
 | Avancé | `robot_run_python` — exécute du code RobotOM pour tout le reste (relâchements, flambement…) |
+
+## Projets Robot normaux, que tu reprends à la main
+
+Claude construit un **vrai modèle Robot** dans la fenêtre Robot ouverte : tu le vois se construire, et tu peux le modifier toi-même à tout moment.
+- Enregistrement en `.rtd` : par défaut dans `Documents\Robot-MCP\` (ou le chemin demandé), après création, modification et calcul.
+- Tu le rouvres dans Robot comme n'importe quel projet. Si les résultats n'apparaissent pas à la réouverture, clique sur **Calculer**.
+- Courbes dans Robot : **Résultats > Diagrammes pour barres**. Courbes exportées par Claude : dossier `diagrammes\` à côté du projet.
 
 ## Unités (important)
 

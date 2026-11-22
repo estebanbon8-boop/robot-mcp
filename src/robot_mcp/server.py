@@ -159,17 +159,43 @@ async def robot_open_project(path: str) -> dict:
     return await _run(f)
 
 
+def _default_dir():
+    import os
+    d = os.path.join(os.path.expanduser("~"), "Documents", "Robot-MCP")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _save(app, path: str = "", name: str = "") -> str:
+    import datetime
+    import os
+
+    if path:
+        if not path.lower().endswith(".rtd"):
+            path += ".rtd"
+        app.Project.SaveAs(path)
+        return path
+    if app.Project.FileName:
+        app.Project.Save()
+        return app.Project.FileName
+    stem = name or "projet_" + datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    path = os.path.join(_default_dir(), stem + ".rtd")
+    app.Project.SaveAs(path)
+    return path
+
+
 @mcp.tool()
-async def robot_save_project(path: str = "") -> dict:
-    """Enregistre le projet. Si path est donné : 'Enregistrer sous' (.rtd). Rien n'est sur disque avant cet appel."""
+async def robot_save_project(path: str = "", name: str = "") -> dict:
+    """Enregistre le projet (.rtd) pour que l'utilisateur puisse le rouvrir et le modifier dans Robot.
+    - path : chemin complet 'Enregistrer sous'.
+    - sinon, si le projet a déjà un fichier : enregistrement simple.
+    - sinon : Documents\\Robot-MCP\\<name ou projet_date>.rtd.
+    À appeler juste après la création du modèle, puis après chaque modification et après le calcul.
+    Toujours indiquer à l'utilisateur le chemin du fichier."""
 
     def f():
         app, _ = _robot()
-        if path:
-            app.Project.SaveAs(path)
-        else:
-            app.Project.Save()
-        return {"ok": True, "fichier": path or app.Project.FileName}
+        return {"ok": True, "fichier": _save(app, path, name)}
 
     return await _run(f)
 
@@ -440,13 +466,18 @@ async def robot_list_cases() -> dict:
 
 
 @mcp.tool()
-async def robot_calculate() -> dict:
-    """Lance le calcul. Fermer toute boîte de dialogue ouverte dans Robot avant (sinon blocage)."""
+async def robot_calculate(save: bool = True) -> dict:
+    """Lance le calcul puis, par défaut, enregistre le projet (résultats inclus) pour que l'utilisateur
+    retrouve les diagrammes en rouvrant le fichier. Fermer toute boîte de dialogue dans Robot avant
+    (sinon blocage). Si des résultats manquent après réouverture d'un fichier : relancer le calcul."""
 
     def f():
         app, _ = _robot()
         code = app.Project.CalcEngine.Calculate()
-        return {"ok": True, "code_retour": code}
+        out = {"ok": True, "code_retour": code}
+        if save:
+            out["fichier"] = _save(app)
+        return out
 
     return await _run(f)
 
@@ -512,6 +543,88 @@ async def robot_node_displacements(nodes: str, case: int) -> dict:
                         "UZ_mm": round(v.UZ * 1000, 3), "RX_mrad": round(v.RX * 1000, 3),
                         "RY_mrad": round(v.RY * 1000, 3), "RZ_mrad": round(v.RZ * 1000, 3)})
         return {"cas": case, "deplacements": out}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_export_diagrams(bars: str, case: int, quantities: list[str] | None = None, points: int = 21,
+                                folder: str = "", title: str = "") -> dict:
+    """Exporte les diagrammes d'efforts le long des barres en PNG (image) et CSV (Excel).
+    quantities parmi : MY (moment fléchissant), FZ (effort tranchant), FX (effort normal), UZ (flèche, mm).
+    Défaut : MY, FZ, FX. Les barres listées sont mises bout à bout (poutre continue, portique déplié).
+    Fichiers rangés à côté du projet (ou dans Documents\\Robot-MCP). Indiquer les chemins à l'utilisateur.
+    Les diagrammes restent aussi visibles dans Robot : Résultats > Diagrammes pour barres."""
+
+    def f():
+        import csv
+        import os
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        app, s, C = _structure()
+        qs = [q.upper() for q in (quantities or ["MY", "FZ", "FX"])]
+        units = {"MY": "kN·m", "FZ": "kN", "FX": "kN", "UZ": "mm", "MZ": "kN·m", "FY": "kN"}
+        labels = {"MY": "Moment fléchissant My", "FZ": "Effort tranchant Vz", "FX": "Effort normal N",
+                  "UZ": "Flèche Uz", "MZ": "Moment Mz", "FY": "Effort tranchant Vy"}
+        forces = s.Results.Bars.Forces
+        defl = s.Results.Bars.Deflections
+        n = max(3, int(points))
+        rows, x0 = [], 0.0
+        for b in _numbers(s, C, "bar", bars):
+            bar = s.Bars.Get(b)
+            a, e = s.Nodes.Get(bar.StartNode), s.Nodes.Get(bar.EndNode)
+            L = ((e.X - a.X) ** 2 + (e.Y - a.Y) ** 2 + (e.Z - a.Z) ** 2) ** 0.5
+            for k in range(n):
+                r = k / (n - 1)
+                v = forces.Value(b, int(case), r)
+                row = {"barre": b, "x_m": round(x0 + r * L, 4), "MY": v.MY / KN, "FZ": v.FZ / KN,
+                       "FX": v.FX / KN, "MZ": v.MZ / KN, "FY": v.FY / KN}
+                if "UZ" in qs:
+                    row["UZ"] = defl.Value(b, int(case), r).UZ * 1000
+                rows.append(row)
+            x0 += L
+        base = os.path.dirname(app.Project.FileName) if app.Project.FileName else _default_dir()
+        folder_ = folder or os.path.join(base, "diagrammes")
+        os.makedirs(folder_, exist_ok=True)
+        tag = f"cas{case}_barres_{bars.replace(' ', '-')}"
+        csv_path = os.path.join(folder_, f"{tag}.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as fh:
+            cols = ["barre", "x_m"] + qs
+            w = csv.writer(fh, delimiter=";")
+            w.writerow([c if c in ("barre", "x_m") else f"{c} ({units.get(c, '')})" for c in cols])
+            for r in rows:
+                w.writerow([r["barre"], f"{r['x_m']:.3f}".replace(".", ",")]
+                          + [f"{r[c]:.3f}".replace(".", ",") for c in qs])
+        files, extrema = [csv_path], {}
+        xs = [r["x_m"] for r in rows]
+        for q in qs:
+            ys = [r[q] for r in rows]
+            imax, imin = ys.index(max(ys)), ys.index(min(ys))
+            extrema[q] = {"max": round(ys[imax], 3), "x_max_m": xs[imax], "min": round(ys[imin], 3),
+                          "x_min_m": xs[imin], "unite": units.get(q, "")}
+            fig, ax = plt.subplots(figsize=(9, 3.6))
+            ax.plot(xs, ys, color="#1f5fa8", lw=2)
+            ax.fill_between(xs, ys, 0, color="#1f5fa8", alpha=0.15)
+            ax.axhline(0, color="black", lw=0.8)
+            if q == "MY":
+                ax.invert_yaxis()  # convention française : moment positif tracé côté fibre tendue (en bas)
+            for i in {imax, imin}:
+                ax.annotate(f"{ys[i]:.2f} {units.get(q, '')}", (xs[i], ys[i]), textcoords="offset points",
+                            xytext=(0, 8), ha="center", fontsize=9)
+            ax.set_xlabel("x (m)")
+            ax.set_ylabel(f"{q} ({units.get(q, '')})")
+            ax.set_title(f"{title + ' — ' if title else ''}{labels.get(q, q)} — cas {case}")
+            ax.grid(alpha=0.3)
+            fig.tight_layout()
+            png = os.path.join(folder_, f"{tag}_{q}.png")
+            fig.savefig(png, dpi=150)
+            plt.close(fig)
+            files.append(png)
+        return {"fichiers": files, "extremums": extrema}
 
     return await _run(f)
 
