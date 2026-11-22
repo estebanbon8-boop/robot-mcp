@@ -42,7 +42,7 @@ Prérequis : Robot installé et **lancé une fois** ; `uv` (`winget install --id
 
 ```powershell
 cd $HOME
-git clone https://github.com/<ton-compte>/robot-mcp.git
+git clone https://github.com/estebanbon8-boop/robot-mcp.git
 cd robot-mcp
 # Quitter Claude Desktop d'abord (icône près de l'horloge > Quitter)
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -WhatIf   # aperçu
