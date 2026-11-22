@@ -78,9 +78,9 @@ def _structure():
 def _cast(obj, interface: str):
     """Robot renvoie souvent des objets génériques (IRobotDataObject, IRobotCase) :
     il faut les convertir vers l'interface réelle pour accéder à leurs propriétés."""
-    from win32com.client import CastTo
-
     try:
+        from win32com.client import CastTo
+
         return CastTo(obj, interface)
     except Exception:
         return obj
