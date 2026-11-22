@@ -48,7 +48,7 @@ if (Get-Process -Name "claude" -ErrorAction SilentlyContinue) {
 
 if ($PSCmdlet.ShouldProcess($root, "Créer .venv (Python x64) et installer robot-mcp")) {
     uv python install $pyX64
-    uv venv --python $pyX64 (Join-Path $root ".venv")
+    uv venv --clear --python $pyX64 (Join-Path $root ".venv")
     uv pip install --python $py -e $root
     & $py -m robot_mcp --selfcheck
     if ($LASTEXITCODE -ne 0) { throw "Selfcheck en échec." }
