@@ -1,0 +1,555 @@
+"""Serveur MCP pour Autodesk Robot Structural Analysis (API COM RobotOM).
+
+Unités côté outils (pensées pour l'utilisateur) : m, kN, kN/m, kN·m.
+Résultats renvoyés en kN, kN·m et mm.
+L'API Robot travaille en N, N·m, m : la conversion est faite ici.
+
+Toutes les opérations COM passent par un seul thread dédié (COM est mono-thread).
+Rien n'est écrit sur stdout : stdout est réservé au protocole MCP.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import io
+import logging
+import sys
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
+from mcp.server.fastmcp import FastMCP
+
+logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="[robot-mcp] %(message)s")
+log = logging.getLogger("robot-mcp")
+
+mcp = FastMCP("robot-mcp")
+
+KN = 1000.0  # 1 kN = 1000 N
+
+
+# --------------------------------------------------------------------------- COM
+
+
+def _com_init() -> None:
+    try:
+        import pythoncom
+
+        pythoncom.CoInitialize()
+    except Exception as exc:  # l'erreur ressortira à l'appel, sans casser le pool
+        log.error(f"Initialisation COM impossible : {exc}")
+
+
+_executor = ThreadPoolExecutor(max_workers=1, initializer=_com_init)
+_state: dict[str, Any] = {"app": None, "C": None}
+
+
+def _robot():
+    """Retourne (app, constantes), en se connectant à Robot si besoin."""
+    if _state["app"] is not None:
+        try:
+            _ = _state["app"].Visible
+            return _state["app"], _state["C"]
+        except Exception:
+            _state["app"] = None
+    import win32com.client
+    from win32com.client import gencache
+
+    # Génère le module de types pour accéder aux constantes I_... par leur nom.
+    gencache.EnsureDispatch("Robot.Application")
+    app = win32com.client.dynamic.Dispatch("Robot.Application")
+    app.Visible = 1
+    app.Interactive = 1
+    with contextlib.suppress(Exception):
+        app.UserControl = True
+    _state["app"] = app
+    _state["C"] = win32com.client.constants
+    return app, win32com.client.constants
+
+
+def _structure():
+    app, C = _robot()
+    if not app.Project.IsActive:
+        raise RuntimeError("Aucun projet ouvert dans Robot. Utilise robot_new_project ou robot_open_project.")
+    return app, app.Project.Structure, C
+
+
+def _numbers(structure, C, obj_type: str, text: str) -> list[int]:
+    """Convertit une sélection texte Robot ('1to5', '1 3 7', 'all') en liste de numéros."""
+    if text.strip().lower() in ("all", "tout", "tous"):
+        coll = structure.Nodes.GetAll() if obj_type == "node" else structure.Bars.GetAll()
+        return [coll.Get(i).Number for i in range(1, coll.Count + 1)]
+    sel = structure.Selections.Create(C.I_OT_NODE if obj_type == "node" else C.I_OT_BAR)
+    sel.FromText(text)
+    return [sel.Get(i) for i in range(1, sel.Count + 1)]
+
+
+def _sel(structure, C, obj_type: str, text: str):
+    """Objet sélection Robot ; 'all' est converti en liste explicite de numéros."""
+    sel = structure.Selections.Create(C.I_OT_NODE if obj_type == "node" else C.I_OT_BAR)
+    if text.strip().lower() in ("all", "tout", "tous"):
+        text = " ".join(str(n) for n in _numbers(structure, C, obj_type, "all"))
+    sel.FromText(text)
+    return sel
+
+
+async def _run(fn, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(_executor, lambda: fn(*args, **kwargs))
+    except Exception as exc:  # renvoyé à Claude sous forme lisible
+        log.error(traceback.format_exc())
+        return {"erreur": f"{type(exc).__name__}: {exc}"}
+
+
+# ------------------------------------------------------------------ PROJET
+
+
+@mcp.tool()
+async def robot_status() -> dict:
+    """État de la connexion à Robot : version, projet ouvert, nombre de nœuds/barres/cas."""
+
+    def f():
+        app, C = _robot()
+        out = {"connecte": True, "version": app.Version, "projet_ouvert": bool(app.Project.IsActive)}
+        if app.Project.IsActive:
+            s = app.Project.Structure
+            out.update(
+                fichier=app.Project.FileName or "(non enregistré)",
+                noeuds=s.Nodes.GetAll().Count,
+                barres=s.Bars.GetAll().Count,
+                cas=s.Cases.GetAll().Count,
+            )
+        return out
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_new_project(type: str = "frame_2d") -> dict:
+    """Crée un nouveau projet. type : frame_2d (portique plan XZ), frame_3d, truss_2d, building, shell."""
+
+    def f():
+        app, C = _robot()
+        types = {
+            "frame_2d": C.I_PT_FRAME_2D,
+            "frame_3d": C.I_PT_FRAME_3D,
+            "truss_2d": C.I_PT_TRUSS_2D,
+            "building": C.I_PT_BUILDING,
+            "shell": C.I_PT_SHELL,
+        }
+        if type not in types:
+            raise ValueError(f"type inconnu, choisir parmi {list(types)}")
+        app.Project.New(types[type])
+        return {"ok": True, "type": type}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_open_project(path: str) -> dict:
+    """Ouvre un fichier .rtd existant (chemin Windows complet)."""
+
+    def f():
+        app, _ = _robot()
+        app.Project.Open(path)
+        return {"ok": True, "fichier": path}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_save_project(path: str = "") -> dict:
+    """Enregistre le projet. Si path est donné : 'Enregistrer sous' (.rtd). Rien n'est sur disque avant cet appel."""
+
+    def f():
+        app, _ = _robot()
+        if path:
+            app.Project.SaveAs(path)
+        else:
+            app.Project.Save()
+        return {"ok": True, "fichier": path or app.Project.FileName}
+
+    return await _run(f)
+
+
+# ---------------------------------------------------------------- GÉOMÉTRIE
+
+
+@mcp.tool()
+async def robot_add_nodes(nodes: list[dict]) -> dict:
+    """Ajoute des nœuds. nodes = [{"id":1,"x":0,"y":0,"z":0}, ...] en mètres.
+    En portique 2D, le plan de travail est XZ (Z vertical)."""
+
+    def f():
+        _, s, _ = _structure()
+        for n in nodes:
+            s.Nodes.Create(int(n["id"]), float(n.get("x", 0)), float(n.get("y", 0)), float(n.get("z", 0)))
+        return {"ok": True, "crees": len(nodes)}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_add_bars(bars: list[dict]) -> dict:
+    """Ajoute des barres. bars = [{"id":1,"start":1,"end":2}, ...] (numéros de nœuds)."""
+
+    def f():
+        _, s, _ = _structure()
+        for b in bars:
+            s.Bars.Create(int(b["id"]), int(b["start"]), int(b["end"]))
+        return {"ok": True, "crees": len(bars)}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_delete(object_type: str, selection: str) -> dict:
+    """Supprime des objets. object_type : 'node' ou 'bar'. selection : texte Robot ('1to5', '2 4').
+    Attention : supprimer/recréer une barre fait perdre ses relâchements."""
+
+    def f():
+        _, s, C = _structure()
+        sel = _sel(s, C, object_type, selection)
+        if object_type == "node":
+            s.Nodes.DeleteMany(sel)
+        else:
+            s.Bars.DeleteMany(sel)
+        return {"ok": True}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_list_model(max_items: int = 300) -> dict:
+    """Liste les nœuds (coordonnées, appui) et barres (nœuds, section, matériau) du modèle."""
+
+    def f():
+        _, s, C = _structure()
+        nodes, bars = [], []
+        coll = s.Nodes.GetAll()
+        for i in range(1, min(coll.Count, max_items) + 1):
+            n = coll.Get(i)
+            nodes.append(
+                {"id": n.Number, "x": round(n.X, 4), "y": round(n.Y, 4), "z": round(n.Z, 4),
+                 "appui": n.GetLabelName(C.I_LT_SUPPORT) if n.HasLabel(C.I_LT_SUPPORT) else None}
+            )
+        coll = s.Bars.GetAll()
+        for i in range(1, min(coll.Count, max_items) + 1):
+            b = coll.Get(i)
+            bars.append(
+                {"id": b.Number, "start": b.StartNode, "end": b.EndNode,
+                 "section": b.GetLabelName(C.I_LT_BAR_SECTION) if b.HasLabel(C.I_LT_BAR_SECTION) else None,
+                 "materiau": b.GetLabelName(C.I_LT_MATERIAL) if b.HasLabel(C.I_LT_MATERIAL) else None}
+            )
+        return {"noeuds": nodes, "barres": bars}
+
+    return await _run(f)
+
+
+# -------------------------------------------------------------- PROPRIÉTÉS
+
+
+def _ensure_label(s, label_type, name: str, fill):
+    labels = s.Labels
+    if not labels.Exist(label_type, name):
+        lab = labels.Create(label_type, name)
+        fill(lab.Data)
+        labels.Store(lab)
+
+
+@mcp.tool()
+async def robot_set_section(bars: str, section: str) -> dict:
+    """Affecte une section du catalogue Robot aux barres (ex. 'IPE 240', 'HEA 200', 'RRHS 100x50x5').
+    bars : sélection texte ('1to4', 'all')."""
+
+    def f():
+        _, s, C = _structure()
+        _ensure_label(s, C.I_LT_BAR_SECTION, section, lambda d: d.LoadFromDBase(section))
+        s.Bars.SetLabel(_sel(s, C, "bar", bars), C.I_LT_BAR_SECTION, section)
+        return {"ok": True, "section": section, "barres": bars}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_set_material(bars: str, material: str) -> dict:
+    """Affecte un matériau de la base Robot (nom exact de la base, ex. 'S 355' selon la base chargée)."""
+
+    def f():
+        _, s, C = _structure()
+        _ensure_label(s, C.I_LT_MATERIAL, material, lambda d: d.LoadFromDBase(material))
+        s.Bars.SetLabel(_sel(s, C, "bar", bars), C.I_LT_MATERIAL, material)
+        return {"ok": True, "materiau": material}
+
+    return await _run(f)
+
+
+SUPPORTS = {
+    "encastrement": (1, 1, 1, 1, 1, 1),
+    "rotule": (1, 1, 1, 0, 0, 0),
+    "appui_simple": (0, 1, 1, 0, 0, 0),  # libre en X : appui glissant
+}
+
+
+@mcp.tool()
+async def robot_set_support(nodes: str, kind: str = "rotule", custom: list[int] | None = None) -> dict:
+    """Pose un appui sur des nœuds. kind : 'encastrement', 'rotule', 'appui_simple' (glissant en X),
+    ou 'custom' avec custom=[UX,UY,UZ,RX,RY,RZ] (1 = bloqué, 0 = libre)."""
+
+    def f():
+        _, s, C = _structure()
+        flags = tuple(custom) if kind == "custom" and custom else SUPPORTS.get(kind)
+        if flags is None:
+            raise ValueError(f"kind inconnu : {list(SUPPORTS) + ['custom']}")
+        name = kind if kind != "custom" else "custom_" + "".join(str(int(v)) for v in flags)
+
+        def fill(d):
+            d.UX, d.UY, d.UZ, d.RX, d.RY, d.RZ = (int(v) for v in flags)
+
+        _ensure_label(s, C.I_LT_SUPPORT, name, fill)
+        s.Nodes.SetLabel(_sel(s, C, "node", nodes), C.I_LT_SUPPORT, name)
+        return {"ok": True, "appui": name, "noeuds": nodes}
+
+    return await _run(f)
+
+
+# ------------------------------------------------------------------ CHARGES
+
+
+NATURES = {"permanente": "I_CN_PERMANENT", "exploitation": "I_CN_EXPLOATATION", "vent": "I_CN_WIND",
+           "neige": "I_CN_SNOW", "temperature": "I_CN_TEMPERATURE", "accidentelle": "I_CN_ACCIDENTAL",
+           "sismique": "I_CN_SEISMIC"}
+
+
+@mcp.tool()
+async def robot_add_load_case(id: int, name: str, nature: str = "permanente", nonlinear: bool = False) -> dict:
+    """Crée un cas de charge simple. nature : permanente, exploitation, vent, neige, temperature,
+    accidentelle, sismique. nonlinear=True : analyse non linéaire géométrique (2nd ordre)."""
+
+    def f():
+        _, s, C = _structure()
+        nat = getattr(C, NATURES[nature])
+        ana = C.I_CAT_STATIC_NONLINEAR if nonlinear else C.I_CAT_STATIC_LINEAR
+        s.Cases.CreateSimple(int(id), name, nat, ana)
+        return {"ok": True, "cas": id, "nom": name, "nature": nature}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_add_self_weight(case: int) -> dict:
+    """Ajoute le poids propre de toute la structure (direction -Z) dans un cas."""
+
+    def f():
+        _, s, C = _structure()
+        rec = s.Cases.Get(int(case)).Records.New(C.I_LRT_DEAD)
+        rec.SetValue(C.I_DRV_Z, -1)
+        rec.SetValue(C.I_DRV_ENTIRE_STRUCTURE, 1)
+        return {"ok": True, "cas": case}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_add_nodal_force(case: int, nodes: str, fx_kN: float = 0, fy_kN: float = 0, fz_kN: float = 0,
+                                mx_kNm: float = 0, my_kNm: float = 0, mz_kNm: float = 0) -> dict:
+    """Force/moment ponctuel sur des nœuds, en kN et kN·m, repère global. fz négatif = vers le bas."""
+
+    def f():
+        _, s, C = _structure()
+        rec = s.Cases.Get(int(case)).Records.New(C.I_LRT_NODE_FORCE)
+        for key, v in (("I_NFRV_FX", fx_kN), ("I_NFRV_FY", fy_kN), ("I_NFRV_FZ", fz_kN),
+                       ("I_NFRV_CX", mx_kNm), ("I_NFRV_CY", my_kNm), ("I_NFRV_CZ", mz_kNm)):
+            if v:
+                rec.SetValue(getattr(C, key), v * KN)
+        rec.Objects.FromText(nodes)
+        return {"ok": True}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_add_bar_uniform_load(case: int, bars: str, pz_kN_m: float = 0, px_kN_m: float = 0,
+                                     py_kN_m: float = 0, projected: bool = False) -> dict:
+    """Charge répartie uniforme sur des barres, en kN/m, repère global. pz négatif = vers le bas.
+    projected=True : charge projetée (neige sur toiture inclinée)."""
+
+    def f():
+        _, s, C = _structure()
+        rec = s.Cases.Get(int(case)).Records.New(C.I_LRT_BAR_UNIFORM)
+        for key, v in (("I_BURV_PX", px_kN_m), ("I_BURV_PY", py_kN_m), ("I_BURV_PZ", pz_kN_m)):
+            if v:
+                rec.SetValue(getattr(C, key), v * KN)
+        if projected:
+            rec.SetValue(C.I_BURV_PROJECTED, 1)
+        rec.Objects.FromText(bars)
+        return {"ok": True}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_add_bar_point_load(case: int, bars: str, fz_kN: float, position: float = 0.5,
+                                   relative: bool = True) -> dict:
+    """Force ponctuelle verticale sur une barre. position : relative (0 à 1) par défaut, ou en m si relative=False.
+    fz négatif = vers le bas."""
+
+    def f():
+        _, s, C = _structure()
+        rec = s.Cases.Get(int(case)).Records.New(C.I_LRT_BAR_FORCE_CONCENTRATED)
+        rec.SetValue(C.I_BFCRV_FZ, fz_kN * KN)
+        rec.SetValue(C.I_BFCRV_X, position)
+        rec.SetValue(C.I_BFCRV_REL, 1 if relative else 0)
+        rec.Objects.FromText(bars)
+        return {"ok": True}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_add_combination(id: int, name: str, factors: dict[str, float], kind: str = "ELU") -> dict:
+    """Crée une combinaison. kind : ELU, ELS ou ACC. factors = {"1": 1.35, "2": 1.5} (numéro de cas -> coefficient)."""
+
+    def f():
+        _, s, C = _structure()
+        ctype = {"ELU": C.I_CBT_ULS, "ELS": C.I_CBT_SLS, "ACC": C.I_CBT_ACC}[kind.upper()]
+        comb = s.Cases.CreateCombination(int(id), name, ctype, C.I_CN_PERMANENT, C.I_CAT_COMB)
+        for case_id, k in factors.items():
+            comb.CaseFactors.New(int(case_id), float(k))
+        return {"ok": True, "combinaison": id, "type": kind, "facteurs": factors}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_list_cases() -> dict:
+    """Liste les cas de charge et combinaisons (numéro, nom). À vérifier avant de lire des résultats :
+    un cas inexistant renvoie des zéros."""
+
+    def f():
+        _, s, _ = _structure()
+        coll = s.Cases.GetAll()
+        return {"cas": [{"id": coll.Get(i).Number, "nom": coll.Get(i).Name} for i in range(1, coll.Count + 1)]}
+
+    return await _run(f)
+
+
+# ---------------------------------------------------------------- CALCUL
+
+
+@mcp.tool()
+async def robot_calculate() -> dict:
+    """Lance le calcul. Fermer toute boîte de dialogue ouverte dans Robot avant (sinon blocage)."""
+
+    def f():
+        app, _ = _robot()
+        code = app.Project.CalcEngine.Calculate()
+        return {"ok": True, "code_retour": code}
+
+    return await _run(f)
+
+
+# -------------------------------------------------------------- RÉSULTATS
+
+
+@mcp.tool()
+async def robot_bar_forces(bars: str, case: int, points: int = 5) -> dict:
+    """Efforts dans les barres (kN, kN·m) en `points` positions régulières de 0 à 1.
+    Convention Robot : FX > 0 = compression."""
+
+    def f():
+        _, s, C = _structure()
+        res = s.Results.Bars.Forces
+        n = max(2, int(points))
+        out = []
+        for b in _numbers(s, C, "bar", bars):
+            for k in range(n):
+                x = k / (n - 1)
+                v = res.Value(b, int(case), x)
+                out.append({"barre": b, "x_rel": round(x, 3), "FX_kN": round(v.FX / KN, 3),
+                            "FZ_kN": round(v.FZ / KN, 3), "MY_kNm": round(v.MY / KN, 3),
+                            "FY_kN": round(v.FY / KN, 3), "MZ_kNm": round(v.MZ / KN, 3),
+                            "MX_kNm": round(v.MX / KN, 3)})
+        return {"cas": case, "efforts": out}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_node_reactions(nodes: str, case: int) -> dict:
+    """Réactions d'appui (kN, kN·m). Vérifier que leur somme équilibre les charges appliquées."""
+
+    def f():
+        _, s, C = _structure()
+        res = s.Results.Nodes.Reactions
+        out, tot = [], {"FX": 0.0, "FY": 0.0, "FZ": 0.0}
+        for n in _numbers(s, C, "node", nodes):
+            v = res.Value(n, int(case))
+            row = {"noeud": n, "FX_kN": round(v.FX / KN, 3), "FY_kN": round(v.FY / KN, 3),
+                   "FZ_kN": round(v.FZ / KN, 3), "MX_kNm": round(v.MX / KN, 3),
+                   "MY_kNm": round(v.MY / KN, 3), "MZ_kNm": round(v.MZ / KN, 3)}
+            out.append(row)
+            for k in tot:
+                tot[k] += row[f"{k}_kN"]
+        return {"cas": case, "reactions": out, "somme_kN": {k: round(v, 3) for k, v in tot.items()}}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_node_displacements(nodes: str, case: int) -> dict:
+    """Déplacements des nœuds (mm) et rotations (mrad)."""
+
+    def f():
+        _, s, C = _structure()
+        res = s.Results.Nodes.Displacements
+        out = []
+        for n in _numbers(s, C, "node", nodes):
+            v = res.Value(n, int(case))
+            out.append({"noeud": n, "UX_mm": round(v.UX * 1000, 3), "UY_mm": round(v.UY * 1000, 3),
+                        "UZ_mm": round(v.UZ * 1000, 3), "RX_mrad": round(v.RX * 1000, 3),
+                        "RY_mrad": round(v.RY * 1000, 3), "RZ_mrad": round(v.RZ * 1000, 3)})
+        return {"cas": case, "deplacements": out}
+
+    return await _run(f)
+
+
+# ------------------------------------------------------------- AVANCÉ
+
+
+@mcp.tool()
+async def robot_run_python(code: str) -> dict:
+    """AVANCÉ — exécute du code Python avec l'API RobotOM pour ce que les autres outils ne font pas
+    (relâchements, flambement, réglages…). Variables disponibles : app (Robot), structure, C (constantes I_...).
+    Unités de l'API : N, N·m, m. Affecter `result = ...` pour renvoyer une valeur ; print() est capturé.
+    Modifie le modèle : à n'utiliser qu'avec l'accord de l'utilisateur."""
+
+    def f():
+        app, C = _robot()
+        env = {"app": app, "C": C, "structure": app.Project.Structure if app.Project.IsActive else None,
+               "result": None}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            exec(code, env)
+        return {"sortie": buf.getvalue()[-8000:], "result": repr(env.get("result"))[:8000]}
+
+    return await _run(f)
+
+
+# ------------------------------------------------------------------ MAIN
+
+
+def main() -> None:
+    if "--selfcheck" in sys.argv:
+        tools = asyncio.run(mcp.list_tools())
+        print(f"robot-mcp OK : {len(tools)} outils", file=sys.stderr)
+        for t in tools:
+            print(" -", t.name, file=sys.stderr)
+        return
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()
