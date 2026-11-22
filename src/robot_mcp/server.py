@@ -757,18 +757,6 @@ def main() -> None:
         for t in tools:
             print(" -", t.name, file=sys.stderr)
         return
-    import threading
-
-    def _prewarm():  # le 1er import de matplotlib (cache de polices) peut prendre ~1 min
-        try:
-            import matplotlib
-
-            matplotlib.use("Agg")
-            import matplotlib.pyplot  # noqa: F401
-        except Exception as exc:
-            log.error(f"matplotlib : {exc}")
-
-    threading.Thread(target=_prewarm, daemon=True).start()
     mcp.run()
 
 
