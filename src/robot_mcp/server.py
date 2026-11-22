@@ -629,13 +629,84 @@ async def robot_export_diagrams(bars: str, case: int, quantities: list[str] | No
     return await _run(f)
 
 
+@mcp.tool()
+async def robot_api_search(keyword: str, max_results: int = 80) -> dict:
+    """Cherche dans l'API RobotOM complète (bibliothèque de types de Robot installée) : interfaces,
+    méthodes, propriétés et constantes I_... dont le nom contient `keyword` (ex. 'Release', 'Buckling',
+    'RC', 'Steel', 'Snow', 'Combination', 'Mesh', 'Panel'). À utiliser AVANT d'écrire du code pour
+    robot_run_python, afin d'utiliser des noms réels plutôt que de les deviner."""
+
+    def f():
+        from win32com.client import gencache
+
+        _robot()
+        mod = gencache.GetModuleForProgID("Robot.Application")
+        kw = keyword.lower()
+        interfaces, members, consts = [], [], []
+        for name in dir(mod):
+            cls = getattr(mod, name)
+            if not isinstance(cls, type):
+                continue
+            if kw in name.lower():
+                interfaces.append(name)
+            props = set(getattr(cls, "_prop_map_get_", {}) or {}) | set(getattr(cls, "_prop_map_put_", {}) or {})
+            meths = [m for m in vars(cls) if not m.startswith("_") and callable(getattr(cls, m, None))]
+            for m in sorted(props | set(meths)):
+                if kw in m.lower():
+                    members.append(f"{name}.{m}" + ("" if m in props else "()"))
+        import win32com.client
+
+        for dct in getattr(win32com.client.constants, "__dicts__", []):
+            for cname in dct:
+                if kw in cname.lower():
+                    consts.append(f"{cname}={dct[cname]}")
+        m = int(max_results)
+        return {"interfaces": interfaces[:m], "membres": members[:m], "constantes": consts[:m],
+                "tronque": len(interfaces) > m or len(members) > m or len(consts) > m}
+
+    return await _run(f)
+
+
+@mcp.tool()
+async def robot_api_describe(interface: str) -> dict:
+    """Liste toutes les propriétés et méthodes (avec leurs arguments) d'une interface RobotOM,
+    ex. 'IRobotBarReleaseData', 'IRobotCalcEngine', 'IRobotProject'."""
+
+    def f():
+        import inspect
+
+        from win32com.client import gencache
+
+        _robot()
+        mod = gencache.GetModuleForProgID("Robot.Application")
+        cls = getattr(mod, interface, None)
+        if cls is None:
+            raise ValueError(f"Interface inconnue : {interface}. Utilise robot_api_search d'abord.")
+        props_get = sorted(getattr(cls, "_prop_map_get_", {}) or {})
+        props_put = sorted(getattr(cls, "_prop_map_put_", {}) or {})
+        methods = []
+        for name, fn in vars(cls).items():
+            if name.startswith("_") or not callable(fn):
+                continue
+            try:
+                methods.append(f"{name}{inspect.signature(fn)}".replace("(self, ", "(").replace("(self)", "()"))
+            except (TypeError, ValueError):
+                methods.append(f"{name}(...)")
+        return {"interface": interface, "proprietes_lecture": props_get,
+                "proprietes_ecriture": props_put, "methodes": sorted(methods)}
+
+    return await _run(f)
+
+
 # ------------------------------------------------------------- AVANCÉ
 
 
 @mcp.tool()
 async def robot_run_python(code: str) -> dict:
-    """AVANCÉ — exécute du code Python avec l'API RobotOM pour ce que les autres outils ne font pas
-    (relâchements, flambement, réglages…). Variables disponibles : app (Robot), structure, C (constantes I_...).
+    """Accès COMPLET à Robot — exécute du code Python avec l'API RobotOM pour tout ce que les outils
+    dédiés ne couvrent pas : relâchements, flambement, modal, sismique, neige/vent, panneaux et maillage,
+    dimensionnement acier/BA, ferraillage, réglages de normes, vues, tableaux… Chercher d'abord les noms
+    exacts avec robot_api_search / robot_api_describe, puis tester sur une copie du projet. Variables disponibles : app (Robot), structure, C (constantes I_...).
     Unités de l'API : N, N·m, m. Affecter `result = ...` pour renvoyer une valeur ; print() est capturé.
     Modifie le modèle : à n'utiliser qu'avec l'accord de l'utilisateur."""
 

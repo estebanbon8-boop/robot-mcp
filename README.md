@@ -15,7 +15,7 @@ Serveur **MCP** pour piloter **Autodesk Robot Structural Analysis Professional**
 | Calcul | `robot_calculate` (enregistre automatiquement le projet, résultats inclus) |
 | Résultats | `robot_bar_forces`, `robot_node_reactions` (avec somme pour contrôle d'équilibre), `robot_node_displacements` |
 | Diagrammes | `robot_export_diagrams` — courbes M, V, N, flèche en **PNG** + **CSV** (Excel), avec extremums |
-| Avancé | `robot_run_python` — exécute du code RobotOM pour tout le reste (relâchements, flambement…) |
+| Accès complet | `robot_api_search`, `robot_api_describe` (explorent l'API Robot réellement installée) + `robot_run_python` (exécute n'importe quelle commande RobotOM : relâchements, flambement, modal, neige/vent, panneaux, dimensionnement acier/BA…) |
 
 ## Projets Robot normaux, que tu reprends à la main
 
@@ -23,6 +23,11 @@ Claude construit un **vrai modèle Robot** dans la fenêtre Robot ouverte : tu l
 - Enregistrement en `.rtd` : par défaut dans `Documents\Robot-MCP\` (ou le chemin demandé), après création, modification et calcul.
 - Tu le rouvres dans Robot comme n'importe quel projet. Si les résultats n'apparaissent pas à la réouverture, clique sur **Calculer**.
 - Courbes dans Robot : **Résultats > Diagrammes pour barres**. Courbes exportées par Claude : dossier `diagrammes\` à côté du projet.
+
+## Couverture des fonctionnalités
+
+Les outils dédiés couvrent le flux courant (barres, charges, combinaisons, calcul, résultats, diagrammes). **Tout le reste de l'API RobotOM** est accessible via `robot_run_python`, après que Claude a cherché les noms exacts avec `robot_api_search` / `robot_api_describe`.
+Limite : ce que l'API COM d'Autodesk n'expose pas (certaines boîtes de dialogue ou modules) reste à faire dans l'interface de Robot.
 
 ## Unités (important)
 
