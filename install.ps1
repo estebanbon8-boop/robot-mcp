@@ -1,4 +1,4 @@
-<#
+﻿<#
   Installe robot-mcp et le déclare dans Claude Desktop et/ou Claude Code.
   Usage :  powershell -ExecutionPolicy Bypass -File .\install.ps1 [-Client both|claude-desktop|claude] [-WhatIf]
   Prérequis : Windows, Robot Structural Analysis installé et lancé au moins une fois, uv (winget install astral-sh.uv).
@@ -57,10 +57,12 @@ if ($PSCmdlet.ShouldProcess($root, "Créer .venv (Python x64) et installer robot
 if ($Client -in @("both", "claude-desktop")) {
     $targets = @()
     $targets += Get-ChildItem "$env:LOCALAPPDATA\Claude-Data" -Filter claude_desktop_config.json -Recurse -ErrorAction SilentlyContinue | ForEach-Object FullName
-    $targets += Get-ChildItem "$env:LOCALAPPDATA\Packages" -Filter claude_desktop_config.json -Recurse -ErrorAction SilentlyContinue | ForEach-Object FullName
+    $targets += Get-ChildItem "$env:LOCALAPPDATA\Packages\AnthropicPBC.Claude_*\LocalCache\Roaming\Claude" -Filter claude_desktop_config.json -ErrorAction SilentlyContinue | ForEach-Object FullName
     $targets += "$env:APPDATA\Claude\claude_desktop_config.json"
     foreach ($t in ($targets | Select-Object -Unique)) {
-        if ($PSCmdlet.ShouldProcess($t, "Déclarer robot-mcp (Claude Desktop)")) { Add-Server $t }
+        if ($PSCmdlet.ShouldProcess($t, "Déclarer robot-mcp (Claude Desktop)")) {
+            try { Add-Server $t } catch { Write-Warning "Ignoré (JSON illisible) : $t" }
+        }
     }
 }
 
