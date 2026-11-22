@@ -118,10 +118,34 @@ def _sel(structure, C, obj_type: str, text: str):
     return sel
 
 
+TIMEOUT_S = 150
+
+
+def _quiet(fn):
+    """Exécute fn avec Robot en mode non interactif : pas de boîte de dialogue
+    (« Enregistrer les modifications ? », conversions…) qui bloquerait l'API."""
+    app = _state["app"]
+    if app is not None:
+        with contextlib.suppress(Exception):
+            app.Interactive = 0
+    try:
+        return fn()
+    finally:
+        app = _state["app"]
+        if app is not None:
+            with contextlib.suppress(Exception):
+                app.Interactive = 1
+                app.UserControl = True
+
+
 async def _run(fn, *args, **kwargs):
     loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(_executor, lambda: fn(*args, **kwargs))
+        fut = loop.run_in_executor(_executor, lambda: _quiet(lambda: fn(*args, **kwargs)))
+        return await asyncio.wait_for(fut, TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return {"erreur": f"Robot ne répond pas après {TIMEOUT_S} s. Une boîte de dialogue est probablement "
+                          "ouverte dans Robot : demande à l'utilisateur de la fermer, puis appelle robot_status."}
     except Exception as exc:  # renvoyé à Claude sous forme lisible
         log.error(traceback.format_exc())
         return {"erreur": f"{type(exc).__name__}: {exc}"}
@@ -152,7 +176,7 @@ async def robot_status() -> dict:
 
 @mcp.tool()
 async def robot_new_project(type: str = "frame_2d") -> dict:
-    """Crée un nouveau projet. type : frame_2d (portique plan XZ), frame_3d, truss_2d, building, shell."""
+    """Crée un nouveau projet (ferme le projet courant sans l'enregistrer). type : frame_2d (portique plan XZ), frame_3d, truss_2d, building, shell."""
 
     def f():
         app, C = _robot()
@@ -165,6 +189,8 @@ async def robot_new_project(type: str = "frame_2d") -> dict:
         }
         if type not in types:
             raise ValueError(f"type inconnu, choisir parmi {list(types)}")
+        if app.Project.IsActive:
+            app.Project.Close()
         app.Project.New(types[type])
         return {"ok": True, "type": type}
 
@@ -173,12 +199,21 @@ async def robot_new_project(type: str = "frame_2d") -> dict:
 
 @mcp.tool()
 async def robot_open_project(path: str) -> dict:
-    """Ouvre un fichier .rtd existant (chemin Windows complet)."""
+    """Ouvre un fichier .rtd existant (chemin Windows complet). Ferme le projet courant SANS l'enregistrer :
+    appeler robot_save_project avant si besoin. Renvoie le nombre de nœuds/barres/cas lus."""
 
     def f():
         app, _ = _robot()
+        import os
+
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+        if app.Project.IsActive:
+            app.Project.Close()
         app.Project.Open(path)
-        return {"ok": True, "fichier": path}
+        s = app.Project.Structure
+        return {"ok": True, "fichier": app.Project.FileName or path,
+                "noeuds": s.Nodes.GetAll().Count, "barres": s.Bars.GetAll().Count, "cas": s.Cases.GetAll().Count}
 
     return await _run(f)
 
