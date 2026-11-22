@@ -1,6 +1,6 @@
 [project]
 name = "robot-mcp"
-version = "0.2.3"
+version = "0.2.4"
 description = "Serveur MCP pour piloter Autodesk Robot Structural Analysis depuis Claude (API COM RobotOM)"
 readme = "README.md"
 license = { text = "MIT" }

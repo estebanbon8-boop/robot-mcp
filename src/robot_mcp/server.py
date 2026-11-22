@@ -217,20 +217,23 @@ async def robot_new_project(type: str = "frame_2d") -> dict:
 
 @mcp.tool()
 async def robot_open_project(path: str) -> dict:
-    """Ouvre un fichier .rtd existant (chemin Windows complet). Ferme le projet courant SANS l'enregistrer :
+    """Ouvre un fichier .rtd existant : chemin complet, ou simple nom de fichier rangé dans Documents\\Robot-MCP. Ferme le projet courant SANS l'enregistrer :
     appeler robot_save_project avant si besoin. Renvoie le nombre de nœuds/barres/cas lus."""
 
     def f():
         app, _ = _robot()
         import os
 
-        if not os.path.isfile(path):
-            raise FileNotFoundError(path)
+        p = _path(path)
+        if not os.path.isfile(p) and os.path.isfile(p + ".rtd"):
+            p += ".rtd"
+        if not os.path.isfile(p):
+            raise FileNotFoundError(p)
         if app.Project.IsActive:
             app.Project.Close()
-        app.Project.Open(path)
+        app.Project.Open(p)
         s = app.Project.Structure
-        return {"ok": True, "fichier": app.Project.FileName or path,
+        return {"ok": True, "fichier": app.Project.FileName or p,
                 "noeuds": s.Nodes.GetAll().Count, "barres": s.Bars.GetAll().Count, "cas": s.Cases.GetAll().Count}
 
     return await _run(f)
@@ -243,11 +246,22 @@ def _default_dir():
     return d
 
 
+def _path(p: str) -> str:
+    """Accepte ~, %USERNAME%, %USERPROFILE%… et les chemins relatifs à Documents\\Robot-MCP."""
+    import os
+
+    p = os.path.expanduser(os.path.expandvars(p.strip().strip('"')))
+    if not os.path.isabs(p):
+        p = os.path.join(_default_dir(), p)
+    return p
+
+
 def _save(app, path: str = "", name: str = "", overwrite: bool = False) -> str:
     import datetime
     import os
 
     if path:
+        path = _path(path)
         if not path.lower().endswith(".rtd"):
             path += ".rtd"
         current = (app.Project.FileName or "").lower()
@@ -553,7 +567,9 @@ async def robot_calculate(save: bool = True) -> dict:
     def f():
         app, _ = _robot()
         code = app.Project.CalcEngine.Calculate()
-        out = {"ok": True, "code_retour": code}
+        out = {"ok": True, "code_retour": code,
+               "note": "Le code retour de Robot n'est pas un indicateur fiable à lui seul : valider par "
+                       "l'équilibre des réactions et un contrôle à la main."}
         if save:
             out["fichier"] = _save(app)
         return out
